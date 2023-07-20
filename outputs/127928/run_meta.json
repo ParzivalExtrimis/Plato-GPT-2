@@ -1,0 +1,25 @@
+{
+    "params": {
+        "start_fresh": true,
+        "batch_size": 32,
+        "block_size": 128,
+        "max_epcoh": 1000,
+        "eval_interval": 500,
+        "save_interval": 1500,
+        "learning_rate": 0.0003,
+        "device": "cuda",
+        "eval_iters": 250,
+        "n_embd": 384,
+        "n_head": 6,
+        "n_layer": 6,
+        "dropout": 0.2,
+        "bias": true
+    },
+    "dataset": {
+        "name": "Sam-Harris-Podcast-Transcripts",
+        "path": "C:\\dev\\ai\\Plato-GPT-2\\data.txt"
+    },
+    "last_train_loss": 1.3778287172317505,
+    "last_val_loss": 1.453397512435913,
+    "best_val_loss": 1.453397512435913
+}
