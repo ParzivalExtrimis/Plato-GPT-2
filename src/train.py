@@ -1,186 +1,341 @@
+import datetime
 import os
+import pytz
 import torch
-import random
 import time
 import json
-import torch.nn as nn
-from torch.nn import functional as F
+import math
+import argparse
+import mlflow
+import mlflow.pytorch
+from azureml.core import Run
 from model import GPTLanguageModel, Config
+from web_handler import Web_handler
 
-# hyperparameters
-start_fresh = True
-batch_size = 32 
-block_size = 128
-max_epcoh = 5000
-eval_interval = 500
-save_interval = 1500
-learning_rate = 3e-4
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 250
-n_embd = 384
-n_head = 6
-n_layer = 6
-dropout = 0.2
-bias = True
-# ------------
-
-torch.manual_seed(1337)
-run_id = random.randint(100000, 200000)
-
-input_path = 'data.txt'
-
-# to log the dataset being used
-dataset = {
-    'name' : 'Sam-Harris-Podcast-Transcripts',
-    'path' : os.path.normpath(os.path.abspath(input_path))
-}
-
-with open(input_path, 'r', encoding='latin-1') as f:
-    text = f.read()
-
-# here are all the unique characters that occur in this text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-# create a mapping from characters to integers
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-encode = lambda s: [stoi[c] for c in s] 
-decode = lambda l: ''.join([itos[i] for i in l]) 
-
-# Train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
-
-# data loading
-def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            _, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
-
-# set parameter options to be set for  each train instance
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                    bias=bias, vocab_size=None, dropout=dropout)
-
-#starting from scratch
-if start_fresh is True:
-    model_args['vocab_size'] = vocab_size
-
-    conf = Config(**model_args)
-    model = GPTLanguageModel(conf)
-    m = model.to(device)
-    best_val_loss = 1e9
-
-checkpoints_dir = os.path.join('checkpoints')
-os.makedirs(checkpoints_dir, exist_ok=True)
-
-#==========================================================================================================
-
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
-start = time.time()
-
-last_train_loss = 1e9
-last_val_loss = 1e9
-
-for epoch in range(max_epcoh):
-
-    # every once in a while evaluate the loss on train and val sets
-    if epoch % eval_interval == 0 or epoch == max_epcoh - 1:
-        losses = estimate_loss()
-        last_train_loss = losses['train'].item()
-        last_val_loss = losses['val'].item()
-        print(f"step {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-    if epoch % save_interval == 0 or epoch == max_epcoh -1:
-        if last_val_loss < best_val_loss:
-            best_val_loss = last_val_loss # set new record, save state 
-            checkpoint = {
-                        'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'epoch': epoch,
-                        'best_val_loss': best_val_loss,
-                        'encodings': {
-                            'stoi' : stoi,
-                            'itos' : itos,
-                        },
-            }
-            print(f"saving checkpoint to {os.path.abspath(checkpoints_dir)}")
-
-            torch.save(checkpoint, os.path.join(checkpoints_dir, 'checkpoint.pt'))
+def format_time(secs: float) -> str:
+    return time.strftime('%H:%M:%S', time.gmtime(secs))
     
-    # sample a batch of data
-    xb, yb = get_batch('train')
+def main(args):
 
-    # evaluate the loss
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    torch.manual_seed(1337)
+    # Start Logging
+    run = Run.get_context()
+    run_id = run._run_id
+    if isinstance(run_id, str):
+        mlflow.start_run(run_id=run_id)
+    else:
+        mlflow.start_run()
 
-end = time.time()
+    mlflow.autolog()
 
-#==========================================================================================================
+    #state vars
+    epoch = 0
 
-#ouput logs directory
-logs_dir = os.path.join('outputs', str(run_id))
-os.makedirs(logs_dir, exist_ok=True)
+    # hyperparameters
+    start_fresh = args.start_fresh
+    batch_size = args.batch_size 
+    block_size = args.block_size
+    max_epoch = args.max_epoch
+    eval_interval = args.eval_interval
+    save_interval = args.save_interval
+    device = 'cuda' if torch.cuda.is_available() and args.use_cuda else 'cpu'
+    eval_iters = args.eval_iters
+    n_embd = args.n_embd
+    n_head = args.n_head
+    n_layer = args.n_layer
+    dropout = args.dropout
+    bias = args.bias
 
-# generate from the model; and logging
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+    use_decay = args.use_decay
+    weight_decay = args.weight_decay
+    beta1 = args.beta1
+    beta2 = args.beta2
+    learning_rate = args.learning_rate
+    warmup_iters = args.warmup_iters
+    lr_decay_iters = args.lr_decay_iters
+    min_lr = args.min_lr
 
-with open(os.path.join(logs_dir, 'out.txt'), 'w') as out_f:
-    out_f.write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+    config_f = args.config
+    # ------------
 
-elapse_interval_sec = end - start
-elapsed_time = time.strftime('%H:%M:%S', time.gmtime(elapse_interval_sec))
+    w_handle = Web_handler(config_f)
+    input_path = args.data
 
-params = {
-        'start_fresh' : start_fresh,
-        'batch_size' : batch_size, 
-        'block_size' : block_size,
-        'max_epcoh' : max_epcoh,
-        'eval_interval' : eval_interval,
-        'save_interval' : save_interval,
-        'learning_rate' : learning_rate,
-        'device' : device,
-        'eval_iters' : eval_iters,
-        'n_embd' : n_embd,
-        'n_head' : n_head,
-        'n_layer' : n_layer,
-        'dropout' : dropout,
-        'bias' : bias, 
-}
+    # to log the dataset being used
+    dataset = {
+        'name' : 'Sam-Harris-Podcast-Transcripts',
+        'path' : input_path
+    }
 
-snapshot = {
-    'params' : params,
-    'dataset' : dataset,
-    'last_train_loss' : last_train_loss,
-    'last_val_loss' : last_val_loss,
-    'best_val_loss' : best_val_loss,
-}
+    # log params
+    params = {
+            'start_fresh' : start_fresh,
+            'batch_size' : batch_size, 
+            'block_size' : block_size,
+            'max_epcoh' : max_epoch,
+            'eval_interval' : eval_interval,
+            'save_interval' : save_interval,
+            'learning_rate' : learning_rate,
+            'device' : device,
+            'eval_iters' : eval_iters,
+            'n_embd' : n_embd,
+            'n_head' : n_head,
+            'n_layer' : n_layer,
+            'dropout' : dropout,
+            'bias' : bias, 
+    }
+
+    mlflow.log_params(params)
+
+    with open(input_path, 'r', encoding='latin-1') as f:
+        text = f.read()
+
+    # here are all the unique characters that occur in this text
+    chars = sorted(list(set(text)))
+    vocab_size = len(chars)
+
+    dataset['size'] = len(text)
+    dataset['vocab_size'] = vocab_size
+
+    # create a mapping from characters to integers
+    stoi = { ch:i for i,ch in enumerate(chars) }
+    itos = { i:ch for i,ch in enumerate(chars) }
+    encode = lambda s: [stoi[c] for c in s] 
+    decode = lambda l: ''.join([itos[i] for i in l]) 
+
+    # Train and test splits
+    data = torch.tensor(encode(text), dtype=torch.long)
+    n = int(0.9*len(data)) # first 90% will be train, rest val
+    train_data = data[:n]
+    val_data = data[n:]
+
+    # data loading
+    def get_batch(split):
+        # generate a small batch of data of inputs x and targets y
+        data = train_data if split == 'train' else val_data
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([data[i:i+block_size] for i in ix])
+        y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+        x, y = x.to(device), y.to(device)
+        return x, y
+
+    @torch.no_grad()
+    def estimate_loss():
+        out = {}
+        model.eval()
+        for split in ['train', 'val']:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
+                _, loss = model(X, Y)
+                losses[k] = loss.item()
+            out[split] = losses.mean()
+        model.train()
+        return out
     
-with open(os.path.join(logs_dir,'run_meta.json'), 'w') as fp:
-    json.dump(snapshot, fp, indent=4)
+    # make checkpoints dir for instance; at fresh use for saving checkpoints;
+    #                                    at resume use for downloading and loading checkpoints as well as saving
+    checkpoints_dir = os.path.join('checkpoints')
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    # set parameter options to be set for  each train instance
+    model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                        bias=bias, vocab_size=None, dropout=dropout)
+
+    #starting from scratch
+    if start_fresh:
+        print('Starting model training from scratch...')
+        model_args['vocab_size'] = vocab_size
+
+        conf = Config(**model_args)
+        model = GPTLanguageModel(conf)
+        m = model.to(device)
+        best_val_loss = 1e9
+
+    else:
+        # download saved instances from DataStore
+        w_handle.download_from_datastore('checkpoint', checkpoints_dir)
+        checkpoint = torch.load(os.path.join(checkpoints_dir, 'checkpoint.pt'), map_location=device)
+        checkpoint_model_args = checkpoint['model_args']
+        # force these config attributes to be equal otherwise we can't even resume training
+        # the rest of the attributes (e.g. dropout) can stay as desired from command line
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            if model_args[k] != checkpoint_model_args[k]:
+                print(f'New parameters fount. Does not match checkpoint. Run mode set to [Start_fresh = {start_fresh}]. Overwriting parameters - {k}, Old value: {model_args[k]} - New value: {checkpoint_model_args[k]}')
+                mlflow.log_param(f'new-{k}', checkpoint_model_args[k])
+            model_args[k] = checkpoint_model_args[k]
+
+        # create the model
+        conf = Config(**model_args)
+        model = GPTLanguageModel(conf)
+        state_dict = checkpoint['model']
+        
+        # anomalous prefix in state_dict, removed.
+        unwanted_prefix = '_orig_mod.'
+        for k,_ in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
+        epoch = checkpoint['epoch']
+        best_val_loss = checkpoint['best_val_loss']
+        print(f'Resuming model training from checkpoint [saved at: {checkpoint["timestamp"]}]')
+
+    #decayed learning rate
+    # learning rate decay scheduler (cosine with warmup)
+    def get_lr(it):
+        # 1) linear warmup for warmup_iters steps
+        if it < warmup_iters:
+            return learning_rate * it / warmup_iters
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > lr_decay_iters:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+        return min_lr + coeff * (learning_rate - min_lr)
+
+    #=========================================================================================================
+
+    # create a PyTorch optimizer
+    # optimizer
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device)
+    if not start_fresh:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    checkpoint = None # free up memory
+
+    start = time.time()
+
+    last_train_loss = 1e9
+    last_val_loss = 1e9
+
+    while True:
+        
+        lr = get_lr(epoch) if use_decay else learning_rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        # every once in a while evaluate the loss on train and val sets
+        if epoch % eval_interval == 0:
+            losses = estimate_loss()
+            last_train_loss = losses['train'].item()
+            last_val_loss = losses['val'].item()
+            mlflow.log_metric('Training Loss', losses['train'])
+            mlflow.log_metric('Validation Loss', losses['val'])
+
+            print(f"step {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+        if epoch % save_interval == 0 and epoch > 0:
+            if last_val_loss < best_val_loss:
+                best_val_loss = last_val_loss # set new record, save state 
+                checkpoint = {
+                            'model': model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'model_args': model_args,
+                            'epoch': epoch,
+                            'best_val_loss': best_val_loss,
+                            'timestamp' : datetime.datetime.now(pytz.timezone('Asia/Kolkata')),
+                            'encodings': {
+                                'stoi' : stoi,
+                                'itos' : itos,
+                            },
+                }
+                print(f"saving checkpoint to {os.path.abspath(checkpoints_dir)}")
+                torch.save(checkpoint, os.path.join(checkpoints_dir, 'checkpoint.pt'))
+                w_handle.upload_to_datastore(
+                filepath = os.path.join(checkpoints_dir, 'checkpoint.pt'),
+                name = 'checkpoint',
+                description = 'Checkpoint for torch.save() last commit.',
+                )
+                checkpoint = None # free up memory
+        
+        # sample a batch of data
+        xb, yb = get_batch('train')
+
+        # evaluate the loss
+        _, loss = model(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        #backward pass
+        loss.backward()
+        # step
+        optimizer.step()
+
+        epoch += 1
+        if(epoch > max_epoch):
+            break
+
+    end = time.time()
+
+    #==========================================================================================================
+
+    #ouput logs directory
+    logs_dir = os.path.join('outputs', str(run_id))
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # generate from the model; and logging
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+
+    with open(os.path.join(logs_dir, 'out.txt'), 'w') as out_f:
+        out_f.write(decode(m.generate(context, max_new_tokens=5000)[0].tolist()))
+    w_handle.upload_to_datastore(
+        filepath = os.path.join(logs_dir, 'out.txt'),
+        name = 'model_generated_output',
+        description = 'Text sample generated by model after training',
+    )
+
+    elapse_interval_sec = end - start
+    elapsed_time = format_time(elapse_interval_sec)
+
+    snapshot = {
+        'params' : params,
+        'dataset' : dataset,
+        'training_time': elapsed_time,
+        'last_train_loss' : last_train_loss,
+        'last_val_loss' : last_val_loss,
+        'best_val_loss' : best_val_loss,
+    }
+        
+    with open(os.path.join(logs_dir,'run_meta.json'), 'w') as fp:
+        json.dump(snapshot, fp, indent=4)
+
+    mlflow.log_artifact(os.path.join(logs_dir,'run_meta.json'))
+
+    mlflow.end_run()
+    run.complete()
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument('--data', type=str, help='Location of Dataset file or mount.')
+    parser.add_argument('--config', type=str, help='Location of Config file or mount.')
+    parser.add_argument('--start_fresh', type=bool, default=False, required=False, help='Flag indicates whether to use checkpoints to load at training.')
+    parser.add_argument('--batch_size', type=int, default=32, required=False, help='Number of parallel examples to be used per epoch.')
+    parser.add_argument('--block_size', type=int, default=256, required=False, help='Context window size of the transformer.')
+    parser.add_argument('--max_epoch', type=int, default=10000, required=False, help='Total number of iterations for training.')
+    parser.add_argument('--eval_interval', type=int, default=250, required=False, help='Iterations to wait until next loss evaluation.')
+    parser.add_argument('--save_interval', type=int, default=2500, required=False, help='Iterations to wait until next checkpoint save.')
+    parser.add_argument('--use-cuda', type=bool, default=True, required=False, help='Flag indicates whether to use CUDA at training.')
+    parser.add_argument('--eval_iters', type=int, default=200, required=False, help='Number of samples to use in-order to smooth out loss over batches.')
+    parser.add_argument('--n_embd', type=int, default=768, required=False, help='Size of the embedding dimension.')
+    parser.add_argument('--n_head', type=int, default=12, required=False, help='Number of attention heads.')
+    parser.add_argument('--n_layer', type=int, default=12, required=False, help='Number of times to loop over tranformer layers.')
+    parser.add_argument('--dropout', type=float, default=0.0, required=False, help='Dropout Ratio')
+    parser.add_argument('--bias', type=bool, default=False, required=False, help='Flag indicates whether to use biases in Linear and LayerNorm layers.')
+
+    # optimizer args
+    parser.add_argument('--use_decay', type=bool, default=True, required=False, help='Flag indicated whether to use learning rate decay ( cosine decay ).')
+    parser.add_argument('--learning_rate', type=float, default=6e-4, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--weight_decay', type=float, default=1e-1, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--beta1', type=float, default=0.9, required=False, help='Variable controls decay parameters.')
+    parser.add_argument('--beta2', type=float, default=0.95, required=False, help='Variable controls decay parameters.')
+    parser.add_argument('--warmup_iters', type=int, default=1000, required=False, help='Initial iterations to run linear lr increment upto default lr.')
+    parser.add_argument('--lr_decay_iters', type=int, default=10000, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
+    parser.add_argument('--min_lr', type=float, default=6e-5, required=False, help='The magnitude at which the optimizer step changes the weights.')
+
+    args = parser.parse_args()
+    return args
+
+if __name__ == "__main__":
+    args = get_args()
+    main(args)
