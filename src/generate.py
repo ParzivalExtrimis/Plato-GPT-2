@@ -2,9 +2,11 @@ import os
 import torch
 from model import GPTLanguageModel, Config
 from web_handler import Web_handler
+import random
 
+run_r = random.randint(1000, 3000)
 start = '\n' # can be anything ( shorter than block size, to seed the generation)
-n_samples = 3
+n_samples = 2
 output_len = 5000
 
 torch.manual_seed(1337)
@@ -41,11 +43,17 @@ decode = lambda l: ''.join([itos[i] for i in l])
 start_ids = encode(start)
 idx = torch.tensor(start_ids, dtype=torch.long, device=device).unsqueeze(0)
 
+os.makedirs(os.path.join('samples'), exist_ok=True)
 #generate
-for _ in range(n_samples):
-    out = model.generate(idx, output_len).squeeze(0)
-    print()
-    print(decode(out.tolist()))
-    print('----------------------')
+with open(os.path.normpath(os.path.join('samples', f'{run_r}.txt')), 'w', encoding='latin-1') as f:
+    f.write(f'Parameters: {checkpoint["model_parameters"]}\n')
+    f.write(f'Hyperparams: {checkpoint["model_args"]}\n')
+    f.write(f'Val loss: {checkpoint["best_val_loss"]}\n')
+    f.write(f'Trained at: {checkpoint["timestamp"]}\n')
+    
+    for _ in range(n_samples):
+        out = model.generate(idx, output_len).squeeze(0)
+        f.write(decode(out.tolist()))
+        f.write('\n----------------------\n')
 
 

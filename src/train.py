@@ -5,6 +5,7 @@ import torch
 import time
 import json
 import math
+import subprocess
 import argparse
 import mlflow
 import mlflow.pytorch
@@ -33,6 +34,8 @@ def main(args):
 
     # hyperparameters
     start_fresh = args.start_fresh
+    always_override_checkpoint = args.always_override_checkpoint
+
     batch_size = args.batch_size 
     block_size = args.block_size
     max_epoch = args.max_epoch
@@ -83,6 +86,14 @@ def main(args):
             'n_layer' : n_layer,
             'dropout' : dropout,
             'bias' : bias, 
+            'use_decay' : use_decay,
+            'weight_decay' : weight_decay,
+            'beta1' : beta1,
+            'beta2' : beta2,
+            'learning_rate' : learning_rate,
+            'warmup_iters' : warmup_iters,
+            'lr_decay_iters' : lr_decay_iters,
+            'min_lr' : min_lr,
     }
 
     mlflow.log_params(params)
@@ -180,6 +191,17 @@ def main(args):
         best_val_loss = checkpoint['best_val_loss']
         print(f'Resuming model training from checkpoint [saved at: {checkpoint["timestamp"]}]')
 
+    if not always_override_checkpoint:
+        # download saved instances from DataStore
+        try:
+            w_handle.download_from_datastore('checkpoint', checkpoints_dir)
+            checkpoint = torch.load(os.path.join(checkpoints_dir, 'checkpoint.pt'), map_location=device)
+            best_val_loss = checkpoint['best_val_loss']
+        except Exception as e:
+            print(e, '\n\n','Could not find checkpoint at specified location at the Datastore. Continuing with fresh best loss...')
+        finally:
+            pass
+
     #decayed learning rate
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -226,6 +248,11 @@ def main(args):
             print(f"step {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
         if epoch % save_interval == 0 and epoch > 0:
+            #track gpu stats
+            gpu_stats = subprocess.check_output(['nvidia-smi']).decode('utf-8')
+            curr_time = datetime.datetime.now(pytz.timezone('Asia/Kolkata'))
+            print(f'GPU Stats: {curr_time}\n {gpu_stats}')
+            mlflow.log_text(gpu_stats, os.path.join('gpu_stats', f'{curr_time}.txt'))
             if last_val_loss < best_val_loss:
                 best_val_loss = last_val_loss # set new record, save state 
                 checkpoint = {
@@ -233,8 +260,9 @@ def main(args):
                             'optimizer': optimizer.state_dict(),
                             'model_args': model_args,
                             'epoch': epoch,
+                            'model_parameters' : model.get_num_params(),
                             'best_val_loss': best_val_loss,
-                            'timestamp' : datetime.datetime.now(pytz.timezone('Asia/Kolkata')),
+                            'timestamp' : curr_time,
                             'encodings': {
                                 'stoi' : stoi,
                                 'itos' : itos,
@@ -310,28 +338,30 @@ def get_args():
     parser.add_argument('--data', type=str, help='Location of Dataset file or mount.')
     parser.add_argument('--config', type=str, help='Location of Config file or mount.')
     parser.add_argument('--start_fresh', type=bool, default=False, required=False, help='Flag indicates whether to use checkpoints to load at training.')
+    parser.add_argument('--always_override_checkpoint', type=bool, default=False, required=False, help='Flag indicates whether to override checkpoints even when the current loss is higher than overall best at training.')
+
     parser.add_argument('--batch_size', type=int, default=32, required=False, help='Number of parallel examples to be used per epoch.')
-    parser.add_argument('--block_size', type=int, default=256, required=False, help='Context window size of the transformer.')
+    parser.add_argument('--block_size', type=int, default=288, required=False, help='Context window size of the transformer.')
     parser.add_argument('--max_epoch', type=int, default=10000, required=False, help='Total number of iterations for training.')
     parser.add_argument('--eval_interval', type=int, default=250, required=False, help='Iterations to wait until next loss evaluation.')
-    parser.add_argument('--save_interval', type=int, default=2500, required=False, help='Iterations to wait until next checkpoint save.')
+    parser.add_argument('--save_interval', type=int, default=1000, required=False, help='Iterations to wait until next checkpoint save.')
     parser.add_argument('--use-cuda', type=bool, default=True, required=False, help='Flag indicates whether to use CUDA at training.')
     parser.add_argument('--eval_iters', type=int, default=200, required=False, help='Number of samples to use in-order to smooth out loss over batches.')
     parser.add_argument('--n_embd', type=int, default=768, required=False, help='Size of the embedding dimension.')
     parser.add_argument('--n_head', type=int, default=12, required=False, help='Number of attention heads.')
     parser.add_argument('--n_layer', type=int, default=12, required=False, help='Number of times to loop over tranformer layers.')
     parser.add_argument('--dropout', type=float, default=0.0, required=False, help='Dropout Ratio')
-    parser.add_argument('--bias', type=bool, default=False, required=False, help='Flag indicates whether to use biases in Linear and LayerNorm layers.')
+    parser.add_argument('--bias', type=bool, default=True, required=False, help='Flag indicates whether to use biases in Linear and LayerNorm layers.')
 
     # optimizer args
     parser.add_argument('--use_decay', type=bool, default=True, required=False, help='Flag indicated whether to use learning rate decay ( cosine decay ).')
-    parser.add_argument('--learning_rate', type=float, default=6e-4, required=False, help='The magnitude at which the optimizer step changes the weights.')
-    parser.add_argument('--weight_decay', type=float, default=1e-1, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--learning_rate', type=float, default=6e-6, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--weight_decay', type=float, default=6e-1, required=False, help='The magnitude at which the optimizer step changes the weights.')
     parser.add_argument('--beta1', type=float, default=0.9, required=False, help='Variable controls decay parameters.')
     parser.add_argument('--beta2', type=float, default=0.95, required=False, help='Variable controls decay parameters.')
-    parser.add_argument('--warmup_iters', type=int, default=1000, required=False, help='Initial iterations to run linear lr increment upto default lr.')
-    parser.add_argument('--lr_decay_iters', type=int, default=10000, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
-    parser.add_argument('--min_lr', type=float, default=6e-5, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--warmup_iters', type=int, default=100, required=False, help='Initial iterations to run linear lr increment upto default lr.')
+    parser.add_argument('--lr_decay_iters', type=int, default=7500, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
+    parser.add_argument('--min_lr', type=float, default=6e-7, required=False, help='The magnitude at which the optimizer step changes the weights.')
 
     args = parser.parse_args()
     return args
