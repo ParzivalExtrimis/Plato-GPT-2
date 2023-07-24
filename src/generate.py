@@ -46,6 +46,7 @@ idx = torch.tensor(start_ids, dtype=torch.long, device=device).unsqueeze(0)
 os.makedirs(os.path.join('samples'), exist_ok=True)
 #generate
 with open(os.path.normpath(os.path.join('samples', f'{run_r}.txt')), 'w', encoding='latin-1') as f:
+    f.write('Title: Using lower learning rate and higher decay weights. Val loss decline has been observed to be smoother.')
     f.write(f'Parameters: {checkpoint["model_parameters"]}\n')
     f.write(f'Hyperparams: {checkpoint["model_args"]}\n')
     f.write(f'Val loss: {checkpoint["best_val_loss"]}\n')

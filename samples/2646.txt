@@ -1,0 +1,1 @@
+Title: Using lower learning rate and higher decay weights. Val loss decline has been observed to be smoother.

@@ -1,3 +1,8 @@
 scratchpaper.ipynb
-checkpoints/
 config.json
+more.txt
+
+checkpoints/
+mlruns/
+outputs/
+.vscode/
